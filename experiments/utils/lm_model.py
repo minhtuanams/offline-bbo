@@ -1,14 +1,14 @@
 """
 Hosts a local language model:
     lm = LanguageModel("qwen2.5-7b")
-    lm.forward("Caption this meme template")
+    lm.get_response("Caption this meme template")
 
     # with a system prompt
-    lm.forward("Caption this meme template", system_prompt="You write short, punchy captions.")
+    lm.get_response("Caption this meme template", system_prompt="You write short, punchy captions.")
 
     # multi-turn: user_prompts[i] is answered by assistant_answers[i];
     # the last user prompt has no answer yet (that's what the model replies to)
-    lm.forward(
+    lm.get_response(
         user_prompts=["Hi", "Give me a meme idea", "Make it about Mondays"],
         assistant_answers=["Hello!", "A cat that refuses to wake up."],
         system_prompt="You are a meme expert.",
@@ -16,6 +16,9 @@ Hosts a local language model:
 
 Requirements: pip install torch transformers accelerate
 """
+from dataclasses import dataclass
+from typing import Optional, Union
+
 import torch
 from transformers import (AutoModelForCausalLM, AutoProcessor, AutoTokenizer, 
                         Gemma3ForConditionalGeneration, LlavaNextForConditionalGeneration, LlavaNextProcessor,)
@@ -26,6 +29,25 @@ SUPPORTED_MODELS = {
     "gemma-3-12b": ("google/gemma-3-12b-it", "gemma3"),
     "llava-1.6-7b": ("llava-hf/llava-v1.6-mistral-7b-hf", "llava"),
 }
+
+
+@dataclass
+class LanguageModelResponse:
+    """Generated text and tensors on the model's output device.
+
+    token_ids: [steps], including special tokens such as EOS.
+    logits: [steps, vocabulary_size], before softmax or sampling processors.
+    logits[t, v] scores token ID v given the prompt and token_ids[:t].
+    probs: [steps, vocabulary_size], float32 softmax of raw logits.
+    Optional tensors are present only when requested. Probabilities do not
+    include temperature scaling or sampling filters.
+    Text skips special tokens and strips whitespace; tensors retain all steps.
+    """
+
+    text: str
+    token_ids: torch.Tensor
+    logits: Optional[torch.Tensor] = None
+    probs: Optional[torch.Tensor] = None
 
 
 class LanguageModel:
@@ -107,9 +129,18 @@ class LanguageModel:
             return rest
         return messages
 
-    def forward(self, user_prompts, assistant_answers=None, system_prompt=None) -> str:
-        """Return the model's reply to the last user prompt."""
-        import torch
+    def forward(
+        self, user_prompts, assistant_answers=None, system_prompt=None,
+        *, return_logits: bool = False, return_probs: bool = False,
+    ) -> Union[str, LanguageModelResponse]:
+        """Reply, optionally returning raw logits and/or softmax probabilities.
+
+        Each requested tensor requires memory proportional to steps * vocabulary_size.
+        return_probs=True returns probs[t, v] = P(token v | prompt, tokens[:t]).
+        This is softmax of raw logits, before temperature or sampling filters.
+        Use self.tokenizer.get_vocab() for token-string -> ID mappings,
+        convert_ids_to_tokens() for token pieces, and decode() for readable text.
+        """
 
         messages = self.format_messages(user_prompts, assistant_answers, system_prompt)
 
@@ -130,9 +161,12 @@ class LanguageModel:
         inputs = self.tokenizer(text, return_tensors="pt", add_special_tokens=False)
         inputs = inputs.to(self.model.device)
 
+        return_details = return_logits or return_probs
         gen_kwargs = dict(
             max_new_tokens=self.max_new_tokens,
             do_sample=self.temperature > 0,
+            return_dict_in_generate=return_details,
+            output_logits=return_details,
             pad_token_id=self.tokenizer.pad_token_id
             if self.tokenizer.pad_token_id is not None
             else self.tokenizer.eos_token_id,
@@ -143,7 +177,19 @@ class LanguageModel:
         with torch.inference_mode():
             output = self.model.generate(**inputs, **gen_kwargs)
 
-        new_tokens = output[0][inputs["input_ids"].shape[-1]:]
-        return self.tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
+        sequences = output.sequences if return_details else output
+        new_tokens = sequences[0][inputs["input_ids"].shape[-1]:]
+        response_text = self.tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
+        if return_details:
+            logits = torch.stack(output.logits, dim=1)[0]
+            return LanguageModelResponse(
+                text=response_text,
+                token_ids=new_tokens,
+                logits=logits if return_logits else None,
+                probs=torch.softmax(logits, dim=-1, dtype=torch.float32)
+                if return_probs else None,
+            )
+        return response_text
 
+    # Compatibility for existing callers.
     __call__ = forward
