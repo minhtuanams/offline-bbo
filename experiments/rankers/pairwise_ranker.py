@@ -1,9 +1,11 @@
 import re
 from experiments.rankers.ranker import Ranker
+from experiments.utils.utils import str_to_discrete, discrete_to_str
 
 TASK_DESCRIPTION = '''
     You aim to find a new length-8 DNA sequence, composed of A, C, G, and T,
     with maximum binding affinity with the transcription factor SIX6_REF_R1.
+    You are given some ... examples and oracle score of 
 '''
 
 PAIRWISE_INSTRUCTION = '''
@@ -15,15 +17,16 @@ PAIRWISE_INSTRUCTION = '''
 class PairwiseRanker(Ranker):
     """Merge sort where each comparison is one LLM call on a pair of candidates."""
 
-    def __init__(self, lm, description=TASK_DESCRIPTION, instruction=PAIRWISE_INSTRUCTION):
-        super().__init__(lm)
+    def __init__(self, lm, sampler, description=TASK_DESCRIPTION, instruction=PAIRWISE_INSTRUCTION):
+        self.lm = lm
+        self.sampler = sampler
         self.description = description
         self.instruction = instruction
 
-    def format_prompt(self, seq_a, seq_b):
+    def format_prompt(self, samples, seq_a, seq_b):
         in_context = "\n".join(
             f"DNA Sequence: {seq}, Binding Affinity: {score:.2f}"
-            for seq, score in self.samples
+            for seq, score in samples
         )
         return (
             f"Task Description:\n{self.description}\n\n"
@@ -35,7 +38,11 @@ class PairwiseRanker(Ranker):
 
     def pair_rank(self, seq_a, seq_b):
         '''Return [better, worse]; keeps the input order if the reply is unparsable.'''
-        response = self.lm(self.format_prompt(seq_a, seq_b))
+        # Examples close to this specific pair
+        X_s, y_s = self.sampler.sample(ref=str_to_discrete([seq_a, seq_b]))
+        samples = list(zip(discrete_to_str(X_s), y_s.tolist()))
+
+        response = self.lm(self.format_prompt(samples, seq_a, seq_b))
         for s in re.findall(r"[ACGT]{8}", response.upper()):
             if s == seq_a:
                 return [seq_a, seq_b]
@@ -43,8 +50,7 @@ class PairwiseRanker(Ranker):
                 return [seq_b, seq_a]
         return [seq_a, seq_b]
 
-    def rank(self, samples, cands_str):
-        self.samples = samples  # list of (seq, score)
+    def rank(self, cands_str):
         return self.merge_rank(list(cands_str))
 
     def merge_rank(self, items):

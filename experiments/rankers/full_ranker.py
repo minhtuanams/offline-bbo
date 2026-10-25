@@ -1,5 +1,6 @@
 import re
 from experiments.rankers.ranker import Ranker
+from experiments.utils.utils import discrete_to_str
 
 TASK_DESCRIPTION = '''
     You aim to find a new length-8 DNA sequence, composed of A, C, G, and T,
@@ -11,18 +12,20 @@ INSTRUCTION = '''
     Output only the rankings the new sequences, one sequence per line, no numbering, no explanation.
 '''
 
-
 class FullRanker(Ranker):
-    def __init__(self, lm, description=TASK_DESCRIPTION, instruction=INSTRUCTION):
-        super().__init__(lm)
+    """Rank all candidates in a single LLM call."""
+
+    def __init__(self, lm, sampler, description=TASK_DESCRIPTION, instruction=INSTRUCTION):
+        self.lm = lm
+        self.sampler = sampler
         self.description = description
         self.instruction = instruction
 
-    def format_prompt(self, cands_str):
+    def format_prompt(self, samples, cands_str):
         '''Task description + in-context samples + instruction + candidates.'''
         in_context = "\n".join(
             f"DNA Sequence: {seq}, Binding Affinity: {score:.2f}"
-            for seq, score in self.samples
+            for seq, score in samples
         )
         candidates = "\n".join(f"DNA Sequence: {seq}" for seq in cands_str)
 
@@ -42,7 +45,9 @@ class FullRanker(Ranker):
                 seen.add(s)
         return ranking + [s for s in cands_str if s not in seen]
 
-    def rank(self, samples, cands_str):
-        self.samples = samples  # list of (seq, score)
-        response = self.lm(self.format_prompt(cands_str))
+    def rank(self, cands_str):
+        X_s, y_s = self.sampler.sample()
+        samples = list(zip(discrete_to_str(X_s), y_s.tolist()))
+
+        response = self.lm(self.format_prompt(samples, cands_str))
         return self.parse_ranking(response, cands_str)
